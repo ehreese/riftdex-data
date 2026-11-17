@@ -1,0 +1,54 @@
+name: Prices
+
+# Rebuilds prices.json from TCGCSV once a day and commits it to main when it
+# changed. See README.md for what to do when a run fails.
+
+on:
+  schedule:
+    # TCGCSV updates around 20:00 UTC.
+    - cron: "40 20 * * *"
+    # Catch-up run in case TCGCSV was late or the first run failed. It does
+    # nothing when the first run already published today's data.
+    - cron: "40 23 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: prices
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Run unit tests
+        run: python -I -m unittest discover -s tests
+
+      - name: Build prices.json
+        run: python -I scripts/build_prices.py
+
+      - name: Commit prices.json if it changed
+        # A manual run on another branch builds and tests but never publishes.
+        if: github.ref == 'refs/heads/main'
+        run: |
+          if [ -z "$(git status --porcelain -- prices.json)" ]; then
+            echo "prices.json unchanged; nothing to commit"
+            exit 0
+          fi
+          as_of=$(python -I -c 'import json; print(json.load(open("prices.json"))["sourceUpdatedAt"])')
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add prices.json
+          git commit -m "Prices as of ${as_of}"
+          git push origin HEAD:main
