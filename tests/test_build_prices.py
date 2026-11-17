@@ -161,14 +161,19 @@ class RenderTests(unittest.TestCase):
 
 class ShrinkGuardTests(unittest.TestCase):
 
-    def test_half_is_allowed(self):
-        bp.check_shrink(50, 100, allow_shrink=False)
+    def test_ninety_percent_is_allowed(self):
+        bp.check_shrink(90, 100, allow_shrink=False)
+        bp.check_shrink(1625, 1805, allow_shrink=False)  # 90.03% of the first real file
+        bp.check_shrink(2000, 1805, allow_shrink=False)  # growing is always fine
 
-    def test_less_than_half_is_refused(self):
-        with self.assertRaisesRegex(bp.BuildError, "fewer than half"):
-            bp.check_shrink(49, 100, allow_shrink=False)
+    def test_eighty_nine_percent_is_refused(self):
+        with self.assertRaisesRegex(bp.BuildError, "fewer than 90%"):
+            bp.check_shrink(89, 100, allow_shrink=False)
+        with self.assertRaises(bp.BuildError):
+            bp.check_shrink(1624, 1805, allow_shrink=False)  # 89.97%
 
     def test_override(self):
+        bp.check_shrink(89, 100, allow_shrink=True)
         bp.check_shrink(1, 100, allow_shrink=True)
 
     def test_no_existing_file(self):
@@ -194,7 +199,8 @@ class FakeSource:
 def standard_responses(last_updated=b"2026-11-16T20:05:58+0000"):
     return {
         "last-updated.txt": last_updated,
-        "tcgplayer/89/groups": envelope([{"groupId": 1}, {"groupId": 2}]),
+        "tcgplayer/89/groups": envelope([{"groupId": 1, "name": "Origins"},
+                                         {"groupId": 2, "name": "Spiritforged"}]),
         "tcgplayer/89/1/prices": envelope([price(653069, "Normal", 0.25),
                                            price(653069, "Foil", 3.74)]),
         "tcgplayer/89/2/prices": envelope([price(653002, "Foil", 0.33),
@@ -214,7 +220,9 @@ class RunTests(unittest.TestCase):
 
     def run_build(self, responses, **kwargs):
         source = FakeSource(responses)
-        written = bp.run(source, self.output, now=NOW, log=self.logs.append, **kwargs)
+        self.warnings = []
+        written = bp.run(source, self.output, now=NOW, log=self.logs.append,
+                         warn=self.warnings.append, **kwargs)
         return written, source
 
     def write_existing(self, source_updated_at, rows):
@@ -260,12 +268,46 @@ class RunTests(unittest.TestCase):
         self.assertNotEqual(first["sourceUpdatedAt"], second["sourceUpdatedAt"])
 
     def test_shrink_guard_leaves_file_untouched(self):
-        before = self.write_existing("2026-11-15T20:05:51Z", [[i, 1.0, None] for i in range(1, 6)])
-        with self.assertRaisesRegex(bp.BuildError, "fewer than half"):
+        # The fixtures give 2 rows: 2 of 3 existing rows is 67%, below 90%.
+        before = self.write_existing("2026-11-15T20:05:51Z", [[i, 1.0, None] for i in range(1, 4)])
+        with self.assertRaisesRegex(bp.BuildError, "fewer than 90%"):
             self.run_build(standard_responses())
         self.assertEqual(self.output.read_bytes(), before)
         written, _ = self.run_build(standard_responses(), allow_shrink=True)
         self.assertTrue(written)
+
+    def test_empty_group_is_skipped_with_a_warning(self):
+        responses = standard_responses()
+        responses["tcgplayer/89/groups"] = envelope([
+            {"groupId": 1, "name": "Origins"}, {"groupId": 2, "name": "Spiritforged"},
+            {"groupId": 3, "name": "Next Set"}])
+        responses["tcgplayer/89/3/prices"] = envelope([])
+        written, source = self.run_build(responses)
+        self.assertTrue(written)
+        self.assertIn("tcgplayer/89/3/prices", source.asked)
+        self.assertEqual(self.warnings,
+                         ["warning: group 3 (Next Set) has no prices; skipped"])
+        self.assertEqual(json.loads(self.output.read_text())["prices"],
+                         [[653002, None, 0.33], [653069, 0.25, 3.74]])
+        self.assertIn("from 2 groups", self.logs[-1])
+
+    def test_no_warning_when_every_group_has_prices(self):
+        self.run_build(standard_responses())
+        self.assertEqual(self.warnings, [])
+
+    def test_group_that_loses_its_prices_is_caught_by_the_shrink_guard(self):
+        # Group 1 used to supply most rows; now it is empty.
+        self.write_existing("2026-11-15T20:05:51Z", [[i, 1.0, None] for i in range(1, 11)])
+        responses = standard_responses()
+        responses["tcgplayer/89/1/prices"] = envelope([price(n, "Normal", 1.0)
+                                                       for n in range(100, 109)])
+        self.run_build(responses)  # 10 rows: 100% of the existing 10
+        before = self.output.read_bytes()
+        responses = standard_responses(b"2026-11-17T20:05:58+0000")
+        responses["tcgplayer/89/1/prices"] = envelope([])
+        with self.assertRaisesRegex(bp.BuildError, "fewer than 90%"):
+            self.run_build(responses)
+        self.assertEqual(self.output.read_bytes(), before)
 
     def assert_fails_untouched(self, responses, message):
         before = self.write_existing("2026-11-15T20:05:51Z", [[1, 1.0, None], [2, 2.0, None]])
@@ -279,7 +321,7 @@ class RunTests(unittest.TestCase):
             "missing response": ("tcgplayer/89/2/prices", None, "no response"),
             "success false": ("tcgplayer/89/1/prices", envelope([], success=False), "success"),
             "not json": ("tcgplayer/89/groups", b"<html>busy</html>", "not valid JSON"),
-            "empty group": ("tcgplayer/89/2/prices", envelope([]), "no results"),
+            "empty group list": ("tcgplayer/89/groups", envelope([]), "no Riftbound groups"),
             "conflict": ("tcgplayer/89/2/prices", envelope([price(653069, "Foil", 9.99)]),
                          "two Foil prices"),
             "bad last-updated": ("last-updated.txt", b"oops", "not a timestamp"),
@@ -292,6 +334,12 @@ class RunTests(unittest.TestCase):
                 else:
                     responses[path] = body
                 self.assert_fails_untouched(responses, message)
+
+    def test_no_priced_product_is_an_error(self):
+        responses = standard_responses()
+        responses["tcgplayer/89/1/prices"] = envelope([price(1, "Normal", None)])
+        responses["tcgplayer/89/2/prices"] = envelope([])
+        self.assert_fails_untouched(responses, "no product has a market price")
 
     def test_corrupt_existing_file_is_an_error(self):
         self.output.write_text("{not json")
