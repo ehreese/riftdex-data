@@ -42,12 +42,14 @@ The script stops with a non-zero exit, leaves the published `prices.json` exactl
 - any request fails after one polite retry (the retry happens only for network errors, timeouts, HTTP 429 and 5xx, after a 5 second pause);
 - a response is not valid JSON, has `success` other than `true`, or arrives brotli-encoded (only gzip is requested and supported);
 - `last-updated.txt` is not a timestamp with a time zone;
-- the group list is empty, or any group's price file has no results;
+- the group list is empty;
 - a price row has an unexpected shape: a missing or non-integer `productId`, a `subTypeName` other than `Normal` or `Foil`, or a `marketPrice` that is neither null nor a non-negative number;
 - the same product has two different prices for the same finish (after rounding to cents), for example in two groups;
 - no product has a price at all;
-- the new file would have fewer than half the rows of the published one;
+- the new file would have fewer than 90% of the rows of the published one;
 - the published `prices.json` is not readable as a prices file.
+
+A group whose price file is valid but empty does not stop the run. TCGplayer sometimes lists a new group before it has any products, so the script skips it and prints a warning naming the group (`warning: group <id> (<name>) has no prices; skipped`), which also appears as a warning annotation on the workflow run. If a group that used to have prices comes back empty, its rows disappear from the new file, and the 90% rule stops the run: one main set is 14 to 20% of all rows.
 
 ## Running it locally
 
@@ -67,7 +69,7 @@ python3 -I scripts/build_prices.py --save-raw .cache/raw
 python3 -I scripts/build_prices.py --offline .cache/raw --force
 ```
 
-Other options: `--force` rebuilds even when TCGCSV has not updated, `--allow-shrink` accepts a file with fewer than half the rows of the existing one, and `--output PATH` writes somewhere other than `prices.json`. `.cache/` is ignored by git.
+Other options: `--force` rebuilds even when TCGCSV has not updated, `--allow-shrink` accepts a file with fewer than 90% of the rows of the existing one, and `--output PATH` writes somewhere other than `prices.json`. `.cache/` is ignored by git.
 
 Please run against the network sparingly: TCGCSV is a one-person hobby project and the scheduled job already fetches everything once a day. Use `--save-raw` once and `--offline` after that.
 
@@ -78,9 +80,9 @@ A failed run publishes nothing, so the app keeps the previous prices and shows t
 1. Open the failed run in the Actions tab and read the `Build prices.json` step. Its last lines start with `error:` and say what was wrong.
 2. Decide from the message:
    - **A request failed, timed out or returned bad JSON.** Usually TCGCSV or the network had a bad moment. Let the catch-up run try, or start the workflow by hand once, later. Do not start it repeatedly.
-   - **A group's price file has no results.** Look at that group on [tcgcsv.com](https://tcgcsv.com). If TCGCSV published an incomplete update, its next update will fix it. If an empty group is now normal (for example a newly listed set with no products yet), the script needs a change, through a pull request.
+   - **No Riftbound groups listed.** TCGCSV published an empty or broken group list. Its next update will normally fix it; let the catch-up or next day's run try.
    - **Two different prices for one product, or an unknown `subTypeName`.** TCGCSV's data changed shape. Look at the product named in the message. The script needs a change, and if the file the app reads has to change too, so do [docs/format.md](docs/format.md) and its `version`.
-   - **Fewer than half the rows.** Check whether TCGCSV really lost products. If the drop is genuine, run the script locally with `--allow-shrink`, check the result, and land the new `prices.json` through a pull request. The workflow never passes `--allow-shrink`.
+   - **Fewer than 90% of the rows.** Look for `warning: group … has no prices; skipped` lines just above the error: they name any group that came back empty, the usual cause. Then check on [tcgcsv.com](https://tcgcsv.com) whether TCGCSV really lost those products. A partial TCGCSV update fixes itself with the next update; wait for it. If the drop is genuine (for example TCGplayer removed products), run the script locally with `--allow-shrink`, check the result, and land the new `prices.json` through a pull request. The workflow never passes `--allow-shrink`.
    - **The unit tests failed.** Something merged to `main` broke them. Fix it through a pull request.
    - **The push to `main` failed.** Another commit landed on `main` during the run. The next run will publish normally.
 3. To reproduce a failure locally, run `python3 -I scripts/build_prices.py --save-raw .cache/raw` once, then iterate with `--offline .cache/raw --force`.

@@ -51,6 +51,10 @@ DEFAULT_OUTPUT = REPO_ROOT / "prices.json"
 LAST_UPDATED_PATH = "last-updated.txt"
 GROUPS_PATH = f"tcgplayer/{CATEGORY_ID}/groups"
 
+# A new file must keep at least this share of the published file's rows. One
+# main set is 14-20% of all rows, so losing one stops the run.
+MIN_KEPT_PERCENT = 90
+
 FINISHES = {"Normal": 0, "Foil": 1}  # subTypeName -> index in (normal, foil)
 CENT = Decimal("0.01")
 
@@ -307,10 +311,10 @@ def render(rows, source_updated_at, generated_at):
 
 
 def check_shrink(new_count, old_count, allow_shrink):
-    """Refuse to replace a file with one that has fewer than half its rows."""
-    if old_count and new_count * 2 < old_count and not allow_shrink:
+    """Refuse a file with fewer than MIN_KEPT_PERCENT of the existing rows."""
+    if old_count and new_count * 100 < old_count * MIN_KEPT_PERCENT and not allow_shrink:
         raise BuildError(
-            f"new file would have {new_count} rows, fewer than half of the "
+            f"new file would have {new_count} rows, fewer than {MIN_KEPT_PERCENT}% of the "
             f"existing {old_count}; rerun with --allow-shrink if this is expected")
 
 
@@ -356,8 +360,9 @@ def write_atomically(path, text):
 # ---------------------------------------------------------------------------
 
 
-def run(source, output, force=False, allow_shrink=False, now=None, log=print):
+def run(source, output, force=False, allow_shrink=False, now=None, log=print, warn=None):
     """Build and write prices.json. Returns True if the file was written."""
+    warn = warn or log
     output = Path(output)
     existing = read_existing(output)
 
@@ -366,12 +371,17 @@ def run(source, output, force=False, allow_shrink=False, now=None, log=print):
         log(f"TCGCSV data unchanged since {source_updated_at}; nothing to do")
         return False
 
-    ids = group_ids(parse_results(source.get(GROUPS_PATH), "groups"))
+    groups = parse_results(source.get(GROUPS_PATH), "groups")
+    ids = group_ids(groups)
+    names = {group["groupId"]: group.get("name") for group in groups}
     prices_by_group = {}
     for group_id in ids:
         results = parse_results(source.get(prices_path(group_id)), f"prices for group {group_id}")
         if not results:
-            raise BuildError(f"prices for group {group_id}: no results")
+            # A newly listed group can have no products yet. Skip it; the
+            # shrink guard catches a group that loses its prices.
+            warn(f"warning: group {group_id} ({names.get(group_id)}) has no prices; skipped")
+            continue
         prices_by_group[group_id] = results
 
     rows = build_rows(prices_by_group)
@@ -382,7 +392,7 @@ def run(source, output, force=False, allow_shrink=False, now=None, log=print):
 
     generated_at = format_timestamp(now or datetime.now(timezone.utc))
     write_atomically(output, render(rows, source_updated_at, generated_at))
-    log(f"wrote {output.name}: {len(rows)} rows from {len(ids)} groups, "
+    log(f"wrote {output.name}: {len(rows)} rows from {len(prices_by_group)} groups, "
         f"source updated {source_updated_at}")
     return True
 
@@ -394,12 +404,20 @@ def parse_args(argv):
     parser.add_argument("--force", action="store_true",
                         help="rebuild even if TCGCSV has not updated since the existing file")
     parser.add_argument("--allow-shrink", action="store_true",
-                        help="accept a file with fewer than half the rows of the existing one")
+                        help=f"accept a file with fewer than {MIN_KEPT_PERCENT}%% of the rows "
+                             f"of the existing one")
     parser.add_argument("--offline", metavar="DIR",
                         help="read responses saved by --save-raw instead of the network")
     parser.add_argument("--save-raw", metavar="DIR",
                         help="also save every decoded response under DIR")
     return parser.parse_args(argv)
+
+
+def print_warning(message):
+    """Print a warning; inside GitHub Actions also annotate the run with it."""
+    print(message, file=sys.stderr)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::warning::{message.removeprefix('warning: ')}", flush=True)
 
 
 def main(argv=None):
@@ -409,7 +427,8 @@ def main(argv=None):
     else:
         source = NetworkSource(save_dir=args.save_raw)
     try:
-        run(source, args.output, force=args.force, allow_shrink=args.allow_shrink)
+        run(source, args.output, force=args.force, allow_shrink=args.allow_shrink,
+            warn=print_warning)
     except BuildError as error:
         print(f"error: {error}", file=sys.stderr)
         print("prices.json was not changed", file=sys.stderr)
