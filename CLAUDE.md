@@ -14,7 +14,7 @@ This is a **public** repository. It holds one scheduled job and the price file i
 TCGCSV is a one-person hobby project. The job must:
 
 - Check `https://tcgcsv.com/last-updated.txt` first and do nothing more if the data has not changed since the published file.
-- Run at most a few times a day and fetch each URL once per run, with a pause of at least 150 ms between requests and no parallel requests.
+- Contact TCGCSV from at most a few runs a day and fetch each URL once per run, with a pause of at least 150 ms between requests and no parallel requests. The job is scheduled hourly so each day's update is published soon after it appears, but a run makes no request at all unless an update is due (23 hours after the last one), and once an update is overdue only four runs a day ask.
 - Send a descriptive User-Agent that names this repository.
 - Never retry in a tight loop. On any failure, stop, exit non-zero, and leave the previously published file untouched.
 
