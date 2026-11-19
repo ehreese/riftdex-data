@@ -6,11 +6,26 @@ name: Prices
 
 on:
   schedule:
-    # TCGCSV updates around 20:00 UTC.
-    - cron: "40 20 * * *"
-    # Catch-up run in case TCGCSV was late or the first run failed. It does
-    # nothing when the first run already published today's data.
-    - cron: "40 23 * * *"
+    # Every hour, at 17 minutes past. TCGCSV updates once a day at about
+    # 20:05 UTC, and GitHub often starts scheduled runs hours late, so an
+    # hourly schedule publishes each update soon after it appears.
+    #
+    # Hourly does not mean contacting TCGCSV hourly. A run reads the
+    # published prices.json first and, if TCGCSV's last update was less than
+    # 23 hours ago, stops without making a single request. Only a run 23
+    # hours or more after the last update reads last-updated.txt, and only
+    # the first run after the new update downloads the price files. On a
+    # normal day TCGCSV is contacted by one or two runs.
+    #
+    # When the update is late, the job backs off. Once prices.json is 29
+    # hours old or more (TCGCSV has not updated, or runs keep failing), a
+    # scheduled run asks TCGCSV only in the 00, 06, 12 and 18 UTC hours;
+    # every other run stops without a request. A day with no update costs
+    # about 6 single requests and then 4 a day, and a failure that does not
+    # clear repeats at most about 6 times and then 4 times a day.
+    - cron: "17 * * * *"
+  # A run started by hand always reads last-updated.txt, whatever the age
+  # of prices.json (--check-now below).
   workflow_dispatch:
 
 permissions:
@@ -37,7 +52,14 @@ jobs:
         run: python -I -m unittest discover -s tests
 
       - name: Build prices.json and append to the history
-        run: python -I scripts/build_prices.py
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            python -I scripts/build_prices.py --check-now
+          else
+            python -I scripts/build_prices.py
+          fi
 
       - name: Commit prices.json and the history if they changed
         # A manual run on another branch builds and tests but never publishes.

@@ -12,6 +12,18 @@ The script is split in two halves:
   functions from raw responses to rows to the text of the file. The unit
   tests cover this half without any network.
 
+The job is scheduled every hour, but TCGCSV updates once a day. So before
+anything else, run() asks whether an update is due at all: when the
+published prices.json says TCGCSV last updated less than 23 hours ago
+(UPDATE_INTERVAL), the run stops without a single request. Only a run 23
+hours or more after the last update reads last-updated.txt, and only the
+first run after TCGCSV's new update downloads the price files. Once the
+update is overdue (OVERDUE_AFTER, 29 hours), a run goes ahead only in the
+00, 06, 12 and 18 UTC hours (OVERDUE_CHECK_HOURS), so a day without an
+update, or a failure that does not clear, costs a few runs a day rather than
+24. --check-now (passed for runs started by hand) and --force skip both
+rules.
+
 run() ties the two together and applies the safety checks. On any problem
 it raises BuildError, main() prints it and exits non-zero, and the existing
 prices.json is never touched.
@@ -34,7 +46,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
@@ -60,6 +72,16 @@ HISTORY_FOLDER = "history"  # next to the output file
 
 LAST_UPDATED_PATH = "last-updated.txt"
 GROUPS_PATH = f"tcgplayer/{CATEGORY_ID}/groups"
+
+# TCGCSV updates once a day. A run less than this long after the update that
+# the published file comes from contacts nothing.
+UPDATE_INTERVAL = timedelta(hours=23)
+
+# Once the published file is this old, TCGCSV's update is overdue (or runs
+# keep failing): back off from every hour to every OVERDUE_CHECK_HOURS hours,
+# going ahead only in the UTC hours divisible by it (00, 06, 12, 18).
+OVERDUE_AFTER = timedelta(hours=29)
+OVERDUE_CHECK_HOURS = 6
 
 # A new file must keep at least this share of the published file's rows. One
 # main set is 14-20% of all rows, so losing one stops the run.
@@ -328,6 +350,56 @@ def check_shrink(new_count, old_count, allow_shrink):
             f"existing {old_count}; rerun with --allow-shrink if this is expected")
 
 
+def update_due(existing, now):
+    """Whether TCGCSV may have updated since the published file, and why.
+
+    Returns (due, reason). Not due when the file's sourceUpdatedAt is in
+    the past and less than UPDATE_INTERVAL before now, or OVERDUE_AFTER or
+    more before now while the UTC hour of now is not divisible by
+    OVERDUE_CHECK_HOURS (the back-off). No file, a missing or unreadable
+    sourceUpdatedAt, and a sourceUpdatedAt in the future all count as due,
+    with no back-off, so the usual checks decide what happens.
+    """
+    if existing is None:
+        return True, "no published prices.json"
+    stamp = existing.get("sourceUpdatedAt")
+    try:
+        updated = parse_source_timestamp(stamp.encode("utf-8"))
+    except (AttributeError, BuildError):
+        return True, f"published sourceUpdatedAt {stamp!r} is not a timestamp"
+    age = now - datetime.fromisoformat(updated.replace("Z", "+00:00"))
+    if age < timedelta(0):
+        return True, f"published sourceUpdatedAt {updated} is in the future"
+    if age < UPDATE_INTERVAL:
+        due_at = format_timestamp(now + (UPDATE_INTERVAL - age))
+        return False, (f"prices.json is from {updated}, {_describe_age(age)} old; "
+                       f"no update is due before {due_at}")
+    if age >= OVERDUE_AFTER and now.astimezone(timezone.utc).hour % OVERDUE_CHECK_HOURS:
+        return False, (f"update overdue: prices.json is from {updated}, "
+                       f"{_describe_age(age)} old; overdue updates are checked only in the "
+                       f"{_overdue_hours()} UTC hours; next check from "
+                       f"{format_timestamp(_next_overdue_check(now))}")
+    return True, f"prices.json is from {updated}, {_describe_age(age)} old"
+
+
+def _overdue_hours():
+    return ", ".join(f"{hour:02d}" for hour in range(0, 24, OVERDUE_CHECK_HOURS))
+
+
+def _next_overdue_check(now):
+    """The start of the next UTC hour divisible by OVERDUE_CHECK_HOURS."""
+    hour = now.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    hour += timedelta(hours=1)
+    while hour.hour % OVERDUE_CHECK_HOURS:
+        hour += timedelta(hours=1)
+    return hour
+
+
+def _describe_age(age):
+    minutes = int(age.total_seconds()) // 60
+    return f"{minutes // 60} h {minutes % 60:02d} min"
+
+
 def read_existing(path):
     """The existing prices.json as a dict, or None if there is none."""
     try:
@@ -406,14 +478,23 @@ def write_atomically(path, text):
 
 
 def run(source, output, force=False, allow_shrink=False, now=None, log=print, warn=None,
-        history=None):
+        history=None, check_now=False):
     """Build and write prices.json. Returns True if the file was written.
 
     With history (a folder), the new day is also added to the price history.
+    now is the current time (UTC); it decides whether an update is due and
+    becomes generatedAt. check_now (or force) checks TCGCSV even when no
+    update is due or an overdue update is between checks.
     """
     warn = warn or log
     output = Path(output)
+    now = now or datetime.now(timezone.utc)
     existing = read_existing(output)
+
+    due, reason = update_due(existing, now)
+    if not due and not (check_now or force):
+        log(f"{reason}; nothing to do, TCGCSV not contacted")
+        return False
 
     source_updated_at = parse_source_timestamp(source.get(LAST_UPDATED_PATH))
     if existing is not None and existing.get("sourceUpdatedAt") == source_updated_at and not force:
@@ -441,7 +522,7 @@ def run(source, output, force=False, allow_shrink=False, now=None, log=print, wa
 
     history_files = plan_history(history, source_updated_at, rows) if history else {}
 
-    generated_at = format_timestamp(now or datetime.now(timezone.utc))
+    generated_at = format_timestamp(now)
     text = render(rows, source_updated_at, generated_at)
     # The history first and prices.json last: if a write fails part way, the
     # published file still names the previous day.
@@ -460,6 +541,11 @@ def parse_args(argv):
                         help="where to write the file (default: prices.json at the repo root)")
     parser.add_argument("--force", action="store_true",
                         help="rebuild even if TCGCSV has not updated since the existing file")
+    parser.add_argument("--check-now", action="store_true",
+                        help="check last-updated.txt even if the existing file is less than "
+                             f"{UPDATE_INTERVAL.total_seconds() / 3600:g} hours old, or the "
+                             "update is overdue and this is not a check hour (otherwise such "
+                             "a run contacts nothing)")
     parser.add_argument("--allow-shrink", action="store_true",
                         help=f"accept a file with fewer than {MIN_KEPT_PERCENT}%% of the rows "
                              f"of the existing one")
@@ -489,7 +575,7 @@ def main(argv=None):
     try:
         history = None if args.no_history else Path(args.output).parent / HISTORY_FOLDER
         run(source, args.output, force=args.force, allow_shrink=args.allow_shrink,
-            warn=print_warning, history=history)
+            warn=print_warning, history=history, check_now=args.check_now)
     except BuildError as error:
         print(f"error: {error}", file=sys.stderr)
         print("prices.json and the history were not changed", file=sys.stderr)
