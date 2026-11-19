@@ -1,0 +1,6 @@
+{"version":1,"month":"2026-01","currency":"USD","source":"TCGplayer market prices via TCGCSV",
+"days":["2026-01-30"],
+"prices":[
+[1001,[0.25],[3.74]],
+[1002,[1.0],null]
+]}
