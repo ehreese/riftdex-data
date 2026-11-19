@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import build_prices as bp  # noqa: E402
+import price_history as ph  # noqa: E402
 
 SOURCE_TS = "2026-11-16T20:05:58Z"
 NOW = datetime(2026, 11, 16, 20, 31, 7, tzinfo=timezone.utc)
@@ -348,6 +349,131 @@ class RunTests(unittest.TestCase):
         self.assertEqual(self.output.read_text(), "{not json")
 
 
+def write_history(folder, columns):
+    """A history as the backfill leaves it, from {day: rows}."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, text in ph.build_history(columns).items():
+        (folder / name).write_text(text)
+
+
+def snapshot(folder):
+    return {p.relative_to(folder).as_posix(): p.read_bytes()
+            for p in sorted(Path(folder).rglob("*")) if p.is_file()}
+
+
+STANDARD_ROWS = [[653002, None, 0.33], [653069, 0.25, 3.74]]
+
+
+class HistoryAppendTests(unittest.TestCase):
+    """The daily job adds each new prices.json day to history/."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.output = self.root / "prices.json"
+        self.history = self.root / "history"
+        # The backfill ends on the 15th.
+        write_history(self.history, {"2026-11-14": [[653069, 0.2, 3.5]],
+                                     "2026-11-15": [[653069, 0.24, 3.7]]})
+        self.output.write_text(bp.render([[653069, 0.24, 3.7]], "2026-11-15T20:05:51Z",
+                                         "2026-11-15T20:31:07Z"))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def build(self, responses, **kwargs):
+        return bp.run(FakeSource(responses), self.output, now=NOW, log=lambda m: None,
+                      warn=lambda m: None, history=self.history, **kwargs)
+
+    def november(self):
+        return json.loads((self.history / "2026-11.json").read_text())
+
+    def index(self):
+        return json.loads((self.history / "index.json").read_text())
+
+    def test_new_day_is_appended(self):
+        self.assertTrue(self.build(standard_responses()))
+        self.assertEqual(self.november()["days"], ["2026-11-14", "2026-11-15", "2026-11-16"])
+        self.assertEqual(self.november()["prices"], [
+            [653002, None, [None, None, 0.33]],
+            [653069, [0.2, 0.24, 0.25], [3.5, 3.7, 3.74]]])
+        self.assertEqual(self.index(), {"version": 1, "months": ["2026-11"],
+                                        "through": "2026-11-16"})
+
+    def test_matches_a_history_built_in_one_go(self):
+        self.build(standard_responses())
+        expected = self.root / "expected"
+        write_history(expected, {"2026-11-14": [[653069, 0.2, 3.5]],
+                                 "2026-11-15": [[653069, 0.24, 3.7]],
+                                 "2026-11-16": STANDARD_ROWS})
+        self.assertEqual(snapshot(self.history), snapshot(expected))
+
+    def test_same_source_twice_changes_nothing(self):
+        self.build(standard_responses())
+        before = snapshot(self.root)
+        self.assertFalse(self.build(standard_responses()))  # short-circuits
+        self.assertEqual(snapshot(self.root), before)
+        self.assertTrue(self.build(standard_responses(), force=True))  # rebuilds the same day
+        after = snapshot(self.root)
+        self.assertEqual({k: v for k, v in after.items() if k.startswith("history/")},
+                         {k: v for k, v in before.items() if k.startswith("history/")})
+
+    def test_the_seam_with_the_backfill(self):
+        # The backfill's last day and the published prices.json are the same
+        # TCGCSV update: rebuilding that day leaves the history as it was.
+        before = snapshot(self.history)
+        responses = standard_responses(b"2026-11-15T20:05:51+0000")
+        responses["tcgplayer/89/1/prices"] = envelope([price(653069, "Normal", 0.24),
+                                                       price(653069, "Foil", 3.7)])
+        responses["tcgplayer/89/2/prices"] = envelope([])
+        self.assertTrue(self.build(responses, force=True))
+        self.assertEqual(snapshot(self.history), before)
+        # The next day continues the same file.
+        self.build(standard_responses())
+        self.assertEqual(self.november()["days"], ["2026-11-14", "2026-11-15", "2026-11-16"])
+
+    def test_new_month_starts_a_new_file(self):
+        self.build(standard_responses())
+        november = (self.history / "2026-11.json").read_bytes()
+        self.build(standard_responses(b"2026-12-01T20:05:12+0000"))
+        self.assertEqual((self.history / "2026-11.json").read_bytes(), november)
+        december = json.loads((self.history / "2026-12.json").read_text())
+        self.assertEqual(december["days"], ["2026-12-01"])
+        self.assertEqual(december["prices"], [[653002, None, [0.33]],
+                                              [653069, [0.25], [3.74]]])
+        self.assertEqual(self.index(), {"version": 1, "months": ["2026-11", "2026-12"],
+                                        "through": "2026-12-01"})
+
+    def test_day_is_the_utc_date_of_the_source_update(self):
+        self.build(standard_responses(b"2026-11-16T23:30:00-05:00"))  # 04:30 on the 17th, UTC
+        self.assertEqual(self.index()["through"], "2026-11-17")
+
+    def assert_nothing_written(self, responses, message, **kwargs):
+        before = snapshot(self.root)
+        with self.assertRaisesRegex(bp.BuildError, message):
+            self.build(responses, **kwargs)
+        self.assertEqual(snapshot(self.root), before)
+
+    def test_history_problems_publish_nothing(self):
+        self.assert_nothing_written(standard_responses(b"2026-11-14T20:05:00+0000"),
+                                    "past days never change")
+        (self.history / "2026-11.json").write_text("{broken")
+        self.assert_nothing_written(standard_responses(), "not valid JSON")
+        (self.history / "index.json").unlink()
+        self.assert_nothing_written(standard_responses(), "index.json is missing")
+
+    def test_build_problems_leave_the_history_alone(self):
+        responses = standard_responses()
+        responses["tcgplayer/89/2/prices"] = envelope([price(653069, "Foil", 9.99)])
+        self.assert_nothing_written(responses, "two Foil prices")
+
+    def test_without_history_nothing_is_appended(self):
+        before = snapshot(self.history)
+        bp.run(FakeSource(standard_responses()), self.output, now=NOW, log=lambda m: None)
+        self.assertEqual(snapshot(self.history), before)
+
+
 class OfflineAndMainTests(unittest.TestCase):
 
     def test_offline_round_trip_through_main(self):
@@ -358,16 +484,36 @@ class OfflineAndMainTests(unittest.TestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(body)
             output = Path(temp) / "prices.json"
+            history = Path(temp) / "history"
+            write_history(history, {"2026-11-15": [[653069, 0.24, 3.7]]})
             args = ["--offline", str(raw), "--output", str(output)]
             with redirect_stdout():
                 self.assertEqual(bp.main(args), 0)
                 self.assertEqual(json.loads(output.read_text())["prices"][0], [653002, None, 0.33])
-                before = output.read_bytes()
+                self.assertEqual(json.loads((history / "index.json").read_text())["through"],
+                                 "2026-11-16")
+                before = output.read_bytes(), snapshot(history)
                 self.assertEqual(bp.main(args), 0)  # unchanged: short-circuits
-                self.assertEqual(output.read_bytes(), before)
+                self.assertEqual((output.read_bytes(), snapshot(history)), before)
                 (raw / "tcgplayer/89/1/prices").unlink()
                 self.assertEqual(bp.main(args + ["--force"]), 1)
-                self.assertEqual(output.read_bytes(), before)
+                self.assertEqual((output.read_bytes(), snapshot(history)), before)
+
+    def test_no_history_option(self):
+        with tempfile.TemporaryDirectory() as temp:
+            raw = Path(temp) / "raw"
+            for path, body in standard_responses().items():
+                target = raw / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(body)
+            output = Path(temp) / "prices.json"
+            with redirect_stdout():
+                self.assertEqual(bp.main(["--offline", str(raw), "--output", str(output)]), 1)
+                self.assertFalse(output.exists())
+                self.assertEqual(bp.main(["--offline", str(raw), "--output", str(output),
+                                          "--no-history"]), 0)
+            self.assertTrue(output.exists())
+            self.assertFalse((Path(temp) / "history").exists())
 
 
 class redirect_stdout:
