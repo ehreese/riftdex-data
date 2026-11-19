@@ -370,7 +370,7 @@ class UpdateDueTests(unittest.TestCase):
     def test_23_hours_and_over_is_due(self):
         self.assertTrue(self.due(self.EXISTING, self.UPDATED + timedelta(hours=23)))
         self.assertTrue(self.due(self.EXISTING, self.UPDATED + timedelta(hours=23, seconds=1)))
-        self.assertTrue(self.due(self.EXISTING, self.UPDATED + timedelta(days=5)))
+        self.assertTrue(self.due(self.EXISTING, self.UPDATED + timedelta(days=5, hours=-2)))
 
     def test_no_published_file_is_always_due(self):
         self.assertTrue(self.due(None, self.UPDATED))
@@ -397,6 +397,82 @@ class UpdateDueTests(unittest.TestCase):
         self.assertFalse(due)
         self.assertEqual(reason, "prices.json is from 2026-11-18T20:05:56Z, 19 h 03 min old; "
                                  "no update is due before 2026-11-19T19:05:56Z")
+
+
+class OverdueBackOffTests(unittest.TestCase):
+    """From 29 hours on, runs go ahead only in the 00, 06, 12 and 18 UTC hours."""
+
+    EXISTING = {"sourceUpdatedAt": "2026-11-18T00:05:56Z", "prices": []}
+    UPDATED = datetime(2026, 11, 18, 0, 5, 56, tzinfo=timezone.utc)
+
+    def at(self, age, hour=None):
+        """The time age after UPDATED, or the first moment after that in the given UTC hour."""
+        now = self.UPDATED + age
+        while hour is not None and now.hour != hour:
+            now += timedelta(minutes=1)
+        return now
+
+    def test_constants(self):
+        self.assertEqual(bp.OVERDUE_AFTER, timedelta(hours=29))
+        self.assertEqual(bp.OVERDUE_AFTER - bp.UPDATE_INTERVAL, timedelta(hours=6))
+        self.assertEqual(bp.OVERDUE_CHECK_HOURS, 6)
+
+    def test_just_under_29_hours_proceeds_at_any_hour(self):
+        for hour in range(24):
+            with self.subTest(hour=hour):
+                now = datetime(2026, 11, 19, hour, 17, tzinfo=timezone.utc)
+                existing = {"sourceUpdatedAt": bp.format_timestamp(
+                    now - timedelta(hours=29, seconds=-1)), "prices": []}
+                self.assertTrue(bp.update_due(existing, now)[0])
+
+    def test_29_hours_at_hour_05_is_not_checked(self):
+        now = self.UPDATED + timedelta(hours=29)  # 05:05:56 on the 19th
+        self.assertEqual(now.hour, 5)
+        due, reason = bp.update_due(self.EXISTING, now)
+        self.assertFalse(due)
+        self.assertEqual(reason, "update overdue: prices.json is from 2026-11-18T00:05:56Z, "
+                                 "29 h 00 min old; overdue updates are checked only in the "
+                                 "00, 06, 12, 18 UTC hours; next check from 2026-11-19T06:00:00Z")
+
+    def test_29_hours_at_hour_06_proceeds(self):
+        self.assertTrue(bp.update_due(self.EXISTING, self.at(timedelta(hours=29), hour=6))[0])
+
+    def test_several_days_old_at_hours_12_and_13(self):
+        self.assertTrue(bp.update_due(self.EXISTING, self.at(timedelta(days=3), hour=12))[0])
+        due, reason = bp.update_due(self.EXISTING, self.at(timedelta(days=3), hour=13))
+        self.assertFalse(due)
+        self.assertIn("next check from 2026-11-21T18:00:00Z", reason)
+
+    def test_every_check_hour_proceeds_and_no_other_does(self):
+        start = self.UPDATED + timedelta(days=2)
+        proceeding = [hour for hour in range(24)
+                      if bp.update_due(self.EXISTING, start.replace(hour=hour))[0]]
+        self.assertEqual(proceeding, [0, 6, 12, 18])
+
+    def test_next_check_crosses_midnight(self):
+        due, reason = bp.update_due(self.EXISTING, datetime(2026, 11, 20, 19, 17,
+                                                            tzinfo=timezone.utc))
+        self.assertFalse(due)
+        self.assertIn("next check from 2026-11-21T00:00:00Z", reason)
+
+    def test_missing_unreadable_or_future_timestamp_has_no_back_off(self):
+        now = datetime(2026, 11, 19, 5, 17, tzinfo=timezone.utc)
+        for existing in (None, {"prices": []}, {"sourceUpdatedAt": "oops", "prices": []},
+                         {"sourceUpdatedAt": "2027-01-01T00:00:00Z", "prices": []}):
+            with self.subTest(existing=existing):
+                self.assertTrue(bp.update_due(existing, now)[0])
+
+    def test_day_without_an_update_costs_six_runs_then_four_a_day(self):
+        # Hourly runs at 17 past, for three days after the update; count those that go ahead.
+        first = self.UPDATED.replace(minute=17, second=0) + timedelta(hours=1)
+        runs = [first + timedelta(hours=n) for n in range(72)]
+        ahead = [now for now in runs if bp.update_due(self.EXISTING, now)[0]]
+        window = [now for now in ahead if now - self.UPDATED < bp.OVERDUE_AFTER]
+        self.assertEqual(len(window), 6)  # 23 h to 29 h: every hour
+        later = [now for now in ahead if now - self.UPDATED >= bp.OVERDUE_AFTER]
+        self.assertTrue(all(now.hour % 6 == 0 for now in later))
+        self.assertEqual(len([now for now in later if now.date() == datetime(
+            2026, 11, 20).date()]), 4)
 
 
 class HourlyRunTests(unittest.TestCase):
@@ -464,6 +540,38 @@ class HourlyRunTests(unittest.TestCase):
         self.assertTrue(written)
         self.assertEqual(len(self.opened), 4)
         self.assertEqual(json.loads(self.output.read_text())["sourceUpdatedAt"], SOURCE_TS)
+
+    # SOURCE_TS is 2026-11-16T20:05:58Z, so the update is overdue from 01:05:58 on the 18th.
+
+    def test_overdue_at_hour_05_makes_zero_requests(self):
+        now = datetime(2026, 11, 18, 5, 17, tzinfo=timezone.utc)
+        written, source = self.run_at(now)
+        self.assertFalse(written)
+        self.assertEqual(self.opened, [])
+        self.assertEqual(source.requests, 0)
+        self.assertEqual(self.output.read_bytes(), self.before)
+        self.assertIn("update overdue", self.logs[-1])
+        self.assertIn("next check from 2026-11-18T06:00:00Z", self.logs[-1])
+        self.assertIn("TCGCSV not contacted", self.logs[-1])
+
+    def test_overdue_at_hour_06_reads_last_updated(self):
+        written, _ = self.run_at(datetime(2026, 11, 18, 6, 17, tzinfo=timezone.utc))
+        self.assertFalse(written)  # TCGCSV still says SOURCE_TS
+        self.assertEqual(self.opened, ["https://example.invalid/last-updated.txt"])
+
+    def test_several_days_overdue_at_hours_12_and_13(self):
+        written, _ = self.run_at(datetime(2026, 11, 20, 13, 17, tzinfo=timezone.utc))
+        self.assertEqual(self.opened, [])
+        written, _ = self.run_at(datetime(2026, 11, 20, 12, 17, tzinfo=timezone.utc))
+        self.assertEqual(self.opened, ["https://example.invalid/last-updated.txt"])
+
+    def test_check_now_and_force_proceed_while_overdue(self):
+        now = datetime(2026, 11, 18, 5, 17, tzinfo=timezone.utc)
+        self.run_at(now, check_now=True)
+        self.assertEqual(self.opened, ["https://example.invalid/last-updated.txt"])
+        written, _ = self.run_at(now, force=True)
+        self.assertTrue(written)
+        self.assertEqual(len(self.opened), 4)
 
     def test_force_still_rebuilds_a_fresh_file(self):
         written, _ = self.run_at(NOW, force=True)
@@ -633,7 +741,7 @@ class HistoryAppendTests(unittest.TestCase):
         self.build(standard_responses())
         november = (self.history / "2026-11.json").read_bytes()
         self.build(standard_responses(b"2026-12-01T20:05:12+0000"),
-                   now=datetime(2026, 12, 1, 20, 40, tzinfo=timezone.utc))
+                   now=datetime(2026, 12, 2, 0, 40, tzinfo=timezone.utc))
         self.assertEqual((self.history / "2026-11.json").read_bytes(), november)
         december = json.loads((self.history / "2026-12.json").read_text())
         self.assertEqual(december["days"], ["2026-12-01"])

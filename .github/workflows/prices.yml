@@ -16,6 +16,13 @@ on:
     # hours or more after the last update reads last-updated.txt, and only
     # the first run after the new update downloads the price files. On a
     # normal day TCGCSV is contacted by one or two runs.
+    #
+    # When the update is late, the job backs off. Once prices.json is 29
+    # hours old or more (TCGCSV has not updated, or runs keep failing), a
+    # scheduled run asks TCGCSV only in the 00, 06, 12 and 18 UTC hours;
+    # every other run stops without a request. A day with no update costs
+    # about 6 single requests and then 4 a day, and a failure that does not
+    # clear repeats at most about 6 times and then 4 times a day.
     - cron: "17 * * * *"
   # A run started by hand always reads last-updated.txt, whatever the age
   # of prices.json (--check-now below).
