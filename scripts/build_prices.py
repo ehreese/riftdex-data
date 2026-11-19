@@ -15,6 +15,11 @@ The script is split in two halves:
 run() ties the two together and applies the safety checks. On any problem
 it raises BuildError, main() prints it and exits non-zero, and the existing
 prices.json is never touched.
+
+After a new prices.json is built, run() also adds its day to the monthly
+price history in history/ (scripts/price_history.py, no network). The
+history files are computed before anything is written, so a problem with
+them also leaves every file untouched.
 """
 
 import argparse
@@ -33,6 +38,10 @@ from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import price_history as ph  # noqa: E402
+
 BASE_URL = "https://tcgcsv.com"
 CATEGORY_ID = 89  # Riftbound
 USER_AGENT = "riftdex-data/1.0 (+https://github.com/ehreese/riftdex-data)"
@@ -47,6 +56,7 @@ SOURCE = "TCGplayer market prices via TCGCSV"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT = REPO_ROOT / "prices.json"
+HISTORY_FOLDER = "history"  # next to the output file
 
 LAST_UPDATED_PATH = "last-updated.txt"
 GROUPS_PATH = f"tcgplayer/{CATEGORY_ID}/groups"
@@ -336,6 +346,41 @@ def read_existing(path):
     return document
 
 
+def plan_history(history, source_updated_at, rows):
+    """The history files to write for this build: {path: text}, changed only.
+
+    Adds the day of source_updated_at (UTC) to the month file and the index
+    in the history folder. Nothing is written here.
+    """
+    history = Path(history)
+    day = ph.day_of_timestamp(source_updated_at)
+    index_path = history / ph.INDEX_NAME
+    month_path = history / ph.month_file_name(ph.month_of(day))
+    index_text = _read_text(index_path)
+    if index_text is None:
+        raise BuildError(f"{index_path} is missing; run with --no-history to build "
+                         f"prices.json alone")
+    try:
+        files = ph.append_day(index_text, _read_text(month_path), day, rows)
+    except ph.HistoryError as error:
+        raise BuildError(f"history: {error}") from error
+    planned = {}
+    for name, text in files.items():
+        path = history / name
+        if _read_text(path) != text:
+            planned[path] = text
+    return planned
+
+
+def _read_text(path):
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise BuildError(f"cannot read {path}: {error.strerror}") from error
+
+
 def write_atomically(path, text):
     """Write to a temporary file next to path, then rename over it."""
     path = Path(path)
@@ -360,8 +405,12 @@ def write_atomically(path, text):
 # ---------------------------------------------------------------------------
 
 
-def run(source, output, force=False, allow_shrink=False, now=None, log=print, warn=None):
-    """Build and write prices.json. Returns True if the file was written."""
+def run(source, output, force=False, allow_shrink=False, now=None, log=print, warn=None,
+        history=None):
+    """Build and write prices.json. Returns True if the file was written.
+
+    With history (a folder), the new day is also added to the price history.
+    """
     warn = warn or log
     output = Path(output)
     existing = read_existing(output)
@@ -390,8 +439,16 @@ def run(source, output, force=False, allow_shrink=False, now=None, log=print, wa
     old_count = len(existing["prices"]) if existing is not None else 0
     check_shrink(len(rows), old_count, allow_shrink)
 
+    history_files = plan_history(history, source_updated_at, rows) if history else {}
+
     generated_at = format_timestamp(now or datetime.now(timezone.utc))
-    write_atomically(output, render(rows, source_updated_at, generated_at))
+    text = render(rows, source_updated_at, generated_at)
+    # The history first and prices.json last: if a write fails part way, the
+    # published file still names the previous day.
+    for path in sorted(history_files):
+        write_atomically(path, history_files[path])
+        log(f"wrote {Path(path).parent.name}/{Path(path).name}")
+    write_atomically(output, text)
     log(f"wrote {output.name}: {len(rows)} rows from {len(prices_by_group)} groups, "
         f"source updated {source_updated_at}")
     return True
@@ -410,6 +467,9 @@ def parse_args(argv):
                         help="read responses saved by --save-raw instead of the network")
     parser.add_argument("--save-raw", metavar="DIR",
                         help="also save every decoded response under DIR")
+    parser.add_argument("--no-history", action="store_true",
+                        help=f"do not add the day to the price history in {HISTORY_FOLDER}/ "
+                             f"next to the output file")
     return parser.parse_args(argv)
 
 
@@ -427,11 +487,12 @@ def main(argv=None):
     else:
         source = NetworkSource(save_dir=args.save_raw)
     try:
+        history = None if args.no_history else Path(args.output).parent / HISTORY_FOLDER
         run(source, args.output, force=args.force, allow_shrink=args.allow_shrink,
-            warn=print_warning)
+            warn=print_warning, history=history)
     except BuildError as error:
         print(f"error: {error}", file=sys.stderr)
-        print("prices.json was not changed", file=sys.stderr)
+        print("prices.json and the history were not changed", file=sys.stderr)
         return 1
     finally:
         if not args.offline:

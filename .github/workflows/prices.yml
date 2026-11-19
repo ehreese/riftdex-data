@@ -1,6 +1,7 @@
 name: Prices
 
-# Rebuilds prices.json from TCGCSV once a day and commits it to main when it
+# Rebuilds prices.json from TCGCSV once a day, adds the day to the price
+# history in history/, and commits both to main in one commit when they
 # changed. See README.md for what to do when a run fails.
 
 on:
@@ -35,20 +36,20 @@ jobs:
       - name: Run unit tests
         run: python -I -m unittest discover -s tests
 
-      - name: Build prices.json
+      - name: Build prices.json and append to the history
         run: python -I scripts/build_prices.py
 
-      - name: Commit prices.json if it changed
+      - name: Commit prices.json and the history if they changed
         # A manual run on another branch builds and tests but never publishes.
         if: github.ref == 'refs/heads/main'
         run: |
-          if [ -z "$(git status --porcelain -- prices.json)" ]; then
-            echo "prices.json unchanged; nothing to commit"
+          if [ -z "$(git status --porcelain -- prices.json history)" ]; then
+            echo "prices.json and history unchanged; nothing to commit"
             exit 0
           fi
           as_of=$(python -I -c 'import json; print(json.load(open("prices.json"))["sourceUpdatedAt"])')
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add prices.json
+          git add prices.json history
           git commit -m "Prices as of ${as_of}"
           git push origin HEAD:main
