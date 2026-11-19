@@ -1,0 +1,1 @@
+{"totalItems": 2, "success": true, "errors": [], "results": [{"productId": 1001, "lowPrice": null, "midPrice": null, "highPrice": null, "marketPrice": 0.31, "directLowPrice": null, "subTypeName": "Normal"}, {"productId": 1002, "lowPrice": null, "midPrice": null, "highPrice": null, "marketPrice": 2.1, "directLowPrice": null, "subTypeName": "Foil"}]}
